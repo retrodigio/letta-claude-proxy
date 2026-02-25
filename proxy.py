@@ -5,9 +5,11 @@ Exposes /v1/messages so Letta Server (via LiteLLM) can use a Claude MAX subscrip
 OAuth token via the Claude Agent SDK with native Anthropic formatting.
 """
 
+import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -43,53 +45,189 @@ CONFIG_PATHS = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
 ]
 
+# Default cooldown when a token hits rate limit (5 hours in seconds)
+DEFAULT_COOLDOWN_SECS = int(os.getenv("PROXY_TOKEN_COOLDOWN", str(5 * 60 * 60)))
 
-def _get_oauth_token() -> str:
-    """Resolve OAuth token with priority: env var > config file > macOS Keychain."""
-    # 1. Environment variable (best for Docker/EC2/CI)
-    token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "")
-    if token:
-        return token
 
-    # 2. Config file
-    for config_path in CONFIG_PATHS:
-        if os.path.exists(config_path):
+class TokenPool:
+    """Manages a pool of OAuth tokens with automatic rotation on rate limits."""
+
+    def __init__(self) -> None:
+        self._tokens: list[str] = []
+        self._labels: list[str] = []  # human-readable labels
+        self._active_index: int = 0
+        self._cooldowns: dict[int, float] = {}  # index -> cooldown_until timestamp
+        self._usage_counts: dict[int, int] = {}  # index -> request count
+        self._lock = asyncio.Lock()
+
+    @property
+    def size(self) -> int:
+        return len(self._tokens)
+
+    @property
+    def active_label(self) -> str:
+        if not self._labels:
+            return "none"
+        return self._labels[self._active_index]
+
+    def load(self) -> None:
+        """Load tokens from all sources: env var, config file, macOS Keychain."""
+        tokens_found: list[tuple[str, str]] = []  # (token, label)
+
+        # 1. Environment variable (single token or comma-separated)
+        env_tokens = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+        if env_tokens:
+            for i, t in enumerate(env_tokens.split(","), 1):
+                t = t.strip()
+                if t:
+                    tokens_found.append((t, f"env-{i}"))
+
+        # 2. Config file (supports both single token and array)
+        for config_path in CONFIG_PATHS:
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path) as f:
+                        config = json.load(f)
+
+                    # Array of tokens (preferred for multi-account)
+                    token_list = config.get("oauth_tokens", [])
+                    if isinstance(token_list, list):
+                        for i, entry in enumerate(token_list, 1):
+                            if isinstance(entry, str):
+                                tokens_found.append((entry, f"config-{i}"))
+                            elif isinstance(entry, dict):
+                                t = entry.get("token", "")
+                                label = entry.get("label", f"config-{i}")
+                                if t:
+                                    tokens_found.append((t, label))
+
+                    # Single token (backward compat)
+                    if not token_list:
+                        single = config.get("oauth_token", "") or config.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+                        if single:
+                            tokens_found.append((single, f"config-file"))
+
+                    if tokens_found:
+                        logger.info("Loaded tokens from %s", config_path)
+                        break  # Use first config found
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning("Failed to read config %s: %s", config_path, e)
+
+        # 3. macOS Keychain (single token fallback)
+        if not tokens_found:
             try:
-                with open(config_path) as f:
-                    config = json.load(f)
-                token = config.get("oauth_token", "") or config.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-                if token:
-                    logger.info("OAuth token loaded from %s", config_path)
-                    return token
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning("Failed to read config %s: %s", config_path, e)
+                import subprocess
+                raw = subprocess.check_output(
+                    ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ).strip()
+                if raw:
+                    data = json.loads(raw)
+                    token = (
+                        data.get("claudeAiOauth", {}).get("accessToken", "")
+                        or data.get("accessToken", "")
+                    )
+                    if token:
+                        tokens_found.append((token, "keychain"))
+                        logger.info("OAuth token loaded from macOS Keychain")
+            except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError):
+                pass
 
-    # 3. macOS Keychain (local dev convenience)
-    try:
-        import subprocess
-        raw = subprocess.check_output(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        if raw:
-            data = json.loads(raw)
-            token = (
-                data.get("claudeAiOauth", {}).get("accessToken", "")
-                or data.get("accessToken", "")
+        if not tokens_found:
+            raise RuntimeError(
+                "No OAuth tokens found. Set them via:\n"
+                "  1. CLAUDE_CODE_OAUTH_TOKEN env var (comma-separated for multiple)\n"
+                '  2. ~/.letta-claude-proxy/config.json: {"oauth_tokens": ["sk-...", "sk-..."]}\n'
+                "  3. macOS Keychain (automatic if Claude Code is logged in)"
             )
-            if token:
-                logger.info("OAuth token loaded from macOS Keychain")
-                return token
-    except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError):
-        pass  # Not on macOS or no keychain entry
 
-    raise RuntimeError(
-        "No OAuth token found. Set it via:\n"
-        "  1. CLAUDE_CODE_OAUTH_TOKEN env var\n"
-        "  2. ~/.letta-claude-proxy/config.json: {\"oauth_token\": \"sk-ant-oat01-...\"}\n"
-        "  3. macOS Keychain (automatic if Claude Code is logged in)"
-    )
+        self._tokens = [t for t, _ in tokens_found]
+        self._labels = [l for _, l in tokens_found]
+        self._active_index = 0
+        self._usage_counts = {i: 0 for i in range(len(self._tokens))}
+        logger.info(
+            "Token pool initialized: %d token(s) — [%s]",
+            len(self._tokens),
+            ", ".join(self._labels),
+        )
+
+    def get_active_token(self) -> str:
+        """Get the current active token."""
+        if not self._tokens:
+            raise RuntimeError("Token pool is empty")
+        return self._tokens[self._active_index]
+
+    async def record_usage(self) -> None:
+        """Record a successful request against the active token."""
+        async with self._lock:
+            self._usage_counts[self._active_index] = (
+                self._usage_counts.get(self._active_index, 0) + 1
+            )
+
+    async def rotate_on_limit(self) -> str | None:
+        """Mark current token as rate-limited and rotate to next available.
+        Returns the new active token label, or None if all tokens exhausted."""
+        async with self._lock:
+            now = time.time()
+            cooldown_until = now + DEFAULT_COOLDOWN_SECS
+
+            logger.warning(
+                "Token '%s' (index %d) hit rate limit — cooling down until %s",
+                self._labels[self._active_index],
+                self._active_index,
+                time.strftime("%H:%M:%S", time.localtime(cooldown_until)),
+            )
+            self._cooldowns[self._active_index] = cooldown_until
+
+            # Find next available token
+            for offset in range(1, len(self._tokens) + 1):
+                candidate = (self._active_index + offset) % len(self._tokens)
+                cd = self._cooldowns.get(candidate, 0)
+                if cd <= now:
+                    # This token is available
+                    if candidate in self._cooldowns:
+                        del self._cooldowns[candidate]
+                    self._active_index = candidate
+                    logger.info(
+                        "Rotated to token '%s' (index %d)",
+                        self._labels[candidate],
+                        candidate,
+                    )
+                    return self._labels[candidate]
+
+            # All tokens in cooldown
+            logger.error("All %d tokens are rate-limited!", len(self._tokens))
+            return None
+
+    def status(self) -> dict:
+        """Return pool status for the health endpoint."""
+        now = time.time()
+        tokens_status = []
+        for i in range(len(self._tokens)):
+            cd = self._cooldowns.get(i, 0)
+            if cd > now:
+                state = "cooldown"
+                cooldown_remaining = int(cd - now)
+            else:
+                state = "active" if i == self._active_index else "available"
+                cooldown_remaining = 0
+            tokens_status.append({
+                "label": self._labels[i],
+                "state": state,
+                "requests": self._usage_counts.get(i, 0),
+                "cooldown_remaining_secs": cooldown_remaining,
+                "token_prefix": self._tokens[i][:15] + "..." if self._tokens[i] else "",
+            })
+        return {
+            "pool_size": len(self._tokens),
+            "active_token": self._labels[self._active_index] if self._tokens else None,
+            "tokens": tokens_status,
+        }
+
+
+# Global token pool
+token_pool = TokenPool()
 
 
 # ---------------------------------------------------------------------------
@@ -278,43 +416,71 @@ def _format_tools(tools: list[AnthropicToolDef]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Detect if an exception indicates a rate limit / quota exceeded."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in [
+        "rate limit", "rate_limit", "429", "quota", "overloaded",
+        "too many requests", "capacity", "usage limit", "exceeded",
+    ])
+
+
 async def _call_claude(
     prompt: str,
     system_prompt: str | None,
     model: str,
     max_turns: int = MAX_TURNS,
 ) -> tuple[str, dict]:
-    """Send a prompt to Claude via the Agent SDK and return (text, usage_dict)."""
-    token = _get_oauth_token()
+    """Send a prompt to Claude via the Agent SDK with automatic token rotation."""
+    # Try with current token, rotate on rate limit
+    attempts = token_pool.size
+    last_error: Exception | None = None
 
-    opts = ClaudeAgentOptions(
-        allowed_tools=[],
-        max_turns=max_turns,
-        model=model,
-        env={"CLAUDE_CODE_OAUTH_TOKEN": token},
-    )
-    if system_prompt:
-        opts.system_prompt = system_prompt
+    for attempt in range(attempts):
+        token = token_pool.get_active_token()
 
-    response_text = ""
-    usage_info: dict = {}
+        opts = ClaudeAgentOptions(
+            allowed_tools=[],
+            max_turns=max_turns,
+            model=model,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": token},
+        )
+        if system_prompt:
+            opts.system_prompt = system_prompt
 
-    try:
-        async for message in query(prompt=prompt, options=opts):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        response_text += block.text
-            elif isinstance(message, ResultMessage):
-                if message.result and not response_text:
-                    response_text = message.result
-                if message.usage:
-                    usage_info = message.usage
-    except Exception:
-        logger.exception("Claude Agent SDK query failed")
-        raise
+        response_text = ""
+        usage_info: dict = {}
 
-    return response_text, usage_info
+        try:
+            async for message in query(prompt=prompt, options=opts):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            response_text += block.text
+                elif isinstance(message, ResultMessage):
+                    if message.result and not response_text:
+                        response_text = message.result
+                    if message.usage:
+                        usage_info = message.usage
+
+            await token_pool.record_usage()
+            return response_text, usage_info
+
+        except Exception as exc:
+            last_error = exc
+            if _is_rate_limit_error(exc):
+                new_label = await token_pool.rotate_on_limit()
+                if new_label is None:
+                    # All tokens exhausted
+                    break
+                logger.info("Retrying with token '%s' (attempt %d/%d)", new_label, attempt + 2, attempts)
+                continue
+            else:
+                logger.exception("Claude Agent SDK query failed (non-rate-limit error)")
+                raise
+
+    # All tokens exhausted
+    raise last_error or RuntimeError("All OAuth tokens are rate-limited")
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +496,7 @@ async def _stream_claude(
     max_turns: int = MAX_TURNS,
 ):
     """Yield SSE chunks in Anthropic streaming format."""
-    token = _get_oauth_token()
+    token = token_pool.get_active_token()
 
     opts = ClaudeAgentOptions(
         allowed_tools=[],
@@ -419,10 +585,9 @@ async def _stream_claude(
 async def lifespan(app: FastAPI):
     logger.info("Letta Claude Proxy starting on %s:%s", HOST, PORT)
     try:
-        _get_oauth_token()
-        logger.info("OAuth token found")
+        token_pool.load()
     except RuntimeError as e:
-        logger.warning("OAuth token check: %s", e)
+        logger.warning("Token pool init: %s", e)
     yield
     logger.info("Letta Claude Proxy shutting down")
 
@@ -511,7 +676,10 @@ async def messages(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "token_pool": token_pool.status(),
+    }
 
 
 # ---------------------------------------------------------------------------

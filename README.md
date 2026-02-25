@@ -63,6 +63,7 @@ The proxy finds your OAuth token using this priority:
 
 ### Config file (for EC2/Linux/Docker)
 
+**Single token:**
 ```bash
 mkdir -p ~/.letta-claude-proxy
 cat > ~/.letta-claude-proxy/config.json << 'EOF'
@@ -73,7 +74,47 @@ EOF
 chmod 600 ~/.letta-claude-proxy/config.json
 ```
 
+**Multiple tokens (token pooling):**
+```bash
+cat > ~/.letta-claude-proxy/config.json << 'EOF'
+{
+  "oauth_tokens": [
+    {"token": "sk-ant-oat01-account1-token", "label": "account-1"},
+    {"token": "sk-ant-oat01-account2-token", "label": "account-2"},
+    {"token": "sk-ant-oat01-account3-token", "label": "account-3"}
+  ]
+}
+EOF
+```
+
 You can also place `config.json` next to `proxy.py` as a fallback.
+
+## Token Pooling & Auto-Rotation
+
+If you have multiple MAX subscriptions, the proxy automatically rotates between them when one hits its rate limit.
+
+**How it works:**
+- Requests use the active token until Anthropic returns a rate limit error
+- The proxy marks that token as "cooling down" (default: 5 hours) and switches to the next available token
+- Once a token's cooldown expires, it becomes available again
+- If ALL tokens are exhausted, the rate limit error is returned to the caller
+
+**Monitor the pool:**
+```bash
+curl http://localhost:8400/health | jq .token_pool
+```
+
+Returns which token is active, how many requests each has served, and cooldown status.
+
+**Env var for multiple tokens (comma-separated):**
+```bash
+export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-token1,sk-ant-oat01-token2"
+```
+
+**Customize cooldown period:**
+```bash
+export PROXY_TOKEN_COOLDOWN=18000  # seconds (default: 18000 = 5 hours)
+```
 
 ### Getting your OAuth token
 
