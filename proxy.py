@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -45,19 +44,14 @@ CONFIG_PATHS = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
 ]
 
-# Default cooldown when a token hits rate limit (5 hours in seconds)
-DEFAULT_COOLDOWN_SECS = int(os.getenv("PROXY_TOKEN_COOLDOWN", str(5 * 60 * 60)))
-
-
 class TokenPool:
-    """Manages a pool of OAuth tokens with automatic rotation on rate limits."""
+    """Manages a pool of OAuth tokens with round-robin rotation on rate limits."""
 
     def __init__(self) -> None:
         self._tokens: list[str] = []
-        self._labels: list[str] = []  # human-readable labels
+        self._labels: list[str] = []
         self._active_index: int = 0
-        self._cooldowns: dict[int, float] = {}  # index -> cooldown_until timestamp
-        self._usage_counts: dict[int, int] = {}  # index -> request count
+        self._usage_counts: dict[int, int] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -165,58 +159,27 @@ class TokenPool:
                 self._usage_counts.get(self._active_index, 0) + 1
             )
 
-    async def rotate_on_limit(self) -> str | None:
-        """Mark current token as rate-limited and rotate to next available.
-        Returns the new active token label, or None if all tokens exhausted."""
+    async def rotate_on_limit(self) -> str:
+        """Rotate to the next token in the pool (round-robin)."""
         async with self._lock:
-            now = time.time()
-            cooldown_until = now + DEFAULT_COOLDOWN_SECS
-
+            prev = self._labels[self._active_index]
+            self._active_index = (self._active_index + 1) % len(self._tokens)
             logger.warning(
-                "Token '%s' (index %d) hit rate limit — cooling down until %s",
+                "Token '%s' hit rate limit — rotated to '%s' (index %d)",
+                prev,
                 self._labels[self._active_index],
                 self._active_index,
-                time.strftime("%H:%M:%S", time.localtime(cooldown_until)),
             )
-            self._cooldowns[self._active_index] = cooldown_until
-
-            # Find next available token
-            for offset in range(1, len(self._tokens) + 1):
-                candidate = (self._active_index + offset) % len(self._tokens)
-                cd = self._cooldowns.get(candidate, 0)
-                if cd <= now:
-                    # This token is available
-                    if candidate in self._cooldowns:
-                        del self._cooldowns[candidate]
-                    self._active_index = candidate
-                    logger.info(
-                        "Rotated to token '%s' (index %d)",
-                        self._labels[candidate],
-                        candidate,
-                    )
-                    return self._labels[candidate]
-
-            # All tokens in cooldown
-            logger.error("All %d tokens are rate-limited!", len(self._tokens))
-            return None
+            return self._labels[self._active_index]
 
     def status(self) -> dict:
         """Return pool status for the health endpoint."""
-        now = time.time()
         tokens_status = []
         for i in range(len(self._tokens)):
-            cd = self._cooldowns.get(i, 0)
-            if cd > now:
-                state = "cooldown"
-                cooldown_remaining = int(cd - now)
-            else:
-                state = "active" if i == self._active_index else "available"
-                cooldown_remaining = 0
             tokens_status.append({
                 "label": self._labels[i],
-                "state": state,
+                "active": i == self._active_index,
                 "requests": self._usage_counts.get(i, 0),
-                "cooldown_remaining_secs": cooldown_remaining,
                 "token_prefix": self._tokens[i][:15] + "..." if self._tokens[i] else "",
             })
         return {
@@ -470,17 +433,14 @@ async def _call_claude(
             last_error = exc
             if _is_rate_limit_error(exc):
                 new_label = await token_pool.rotate_on_limit()
-                if new_label is None:
-                    # All tokens exhausted
-                    break
                 logger.info("Retrying with token '%s' (attempt %d/%d)", new_label, attempt + 2, attempts)
                 continue
             else:
                 logger.exception("Claude Agent SDK query failed (non-rate-limit error)")
                 raise
 
-    # All tokens exhausted
-    raise last_error or RuntimeError("All OAuth tokens are rate-limited")
+    # Cycled through all tokens, all rate-limited
+    raise last_error or RuntimeError("All OAuth tokens are currently rate-limited")
 
 
 # ---------------------------------------------------------------------------

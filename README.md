@@ -95,25 +95,20 @@ If you have multiple MAX subscriptions, the proxy automatically rotates between 
 
 **How it works:**
 - Requests use the active token until Anthropic returns a rate limit error
-- The proxy marks that token as "cooling down" (default: 5 hours) and switches to the next available token
-- Once a token's cooldown expires, it becomes available again
-- If ALL tokens are exhausted, the rate limit error is returned to the caller
+- On rate limit, the proxy rotates to the next token (round-robin)
+- Eventually cycles back to earlier tokens once their limit window has reset
+- If all tokens are currently rate-limited, the error is returned to the caller
 
 **Monitor the pool:**
 ```bash
 curl http://localhost:8400/health | jq .token_pool
 ```
 
-Returns which token is active, how many requests each has served, and cooldown status.
+Returns which token is active and how many requests each has served.
 
 **Env var for multiple tokens (comma-separated):**
 ```bash
 export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-token1,sk-ant-oat01-token2"
-```
-
-**Customize cooldown period:**
-```bash
-export PROXY_TOKEN_COOLDOWN=18000  # seconds (default: 18000 = 5 hours)
 ```
 
 ### Getting your OAuth token
