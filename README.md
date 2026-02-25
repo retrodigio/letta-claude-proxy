@@ -77,8 +77,14 @@ You can also place `config.json` next to `proxy.py` as a fallback.
 
 ### Getting your OAuth token
 
+**Option A: Claude CLI (recommended)**
 ```bash
-# On your Mac where Claude Code is logged in:
+claude setup-token
+```
+This opens a browser for authentication and outputs the token in your terminal. Copy it to your config file or env var.
+
+**Option B: macOS Keychain (if already logged in)**
+```bash
 security find-generic-password -s "Claude Code-credentials" -w | \
   python3 -c "import sys,json; d=json.load(sys.stdin); print(d['claudeAiOauth']['accessToken'])"
 ```
